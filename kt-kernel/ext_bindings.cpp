@@ -639,6 +639,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.def("is_ascend_callback_worker_running", &kt::ascend::callback_worker_running,
         "True iff the ACL callback worker is started and dispatching reports.");
 #endif
+  m.def("cpuinfer_inline_enabled", &kt_cpuinfer_inline_enabled,
+        "True iff KT_CPUINFER_INLINE=1: CPUInfer.run_inline runs the task on the calling thread.");
+
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
@@ -650,6 +653,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<int>())
       .def(py::init<WorkerPoolConfig>())
       .def("submit", &CPUInfer::submit)
+      // Runs the task on the calling thread when KT_CPUINFER_INLINE=1 and the
+      // queue is empty; returns whether it did. Off or queue non-empty, it is
+      // submit(). No gil_scoped_release, for the same reason submit/sync have
+      // none: the caller holds the GIL across submit+sync today either way.
+      .def("run_inline", &CPUInfer::run_inline)
       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
@@ -868,6 +876,13 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
           "gpu_experts_mask",
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },
           [](GeneralMOEConfig& self, uintptr_t val) { self.gpu_experts_mask = reinterpret_cast<uint8_t*>(val); })
+      // Allocate/load CPU BufferB only for experts with gpu_experts_mask ==
+      // false. MXFP4 only; see GeneralMOEConfig::skip_gpu_expert_weights.
+      // Origin: dsv4-a5 single-card offload (stage 0.6).
+      .def_readwrite("skip_gpu_expert_weights", &GeneralMOEConfig::skip_gpu_expert_weights)
+      // MXFP4 only: store E8M0 scales as one byte per k-group instead of one
+      // FP32. Default false; see GeneralMOEConfig::compact_mxfp4_scales.
+      .def_readwrite("compact_mxfp4_scales", &GeneralMOEConfig::compact_mxfp4_scales)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)

@@ -131,15 +131,38 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      // Experts resident on the accelerator have no CPU weights when the
+      // caller opted into subset residency: skip the three BufferB
+      // allocations, which are the only per-expert allocations that scale
+      // with the weight size (0.625 B/element for MXFP4). The BufferA/BufferC
+      // handles above own no memory -- they are re-pointed into the shared
+      // pools on every forward -- so they stay in place and keep every vector
+      // indexable by the routed (logical) expert id. forward_prefill /
+      // forward_decode never reach a masked expert because
+      // should_skip_expert() filters it out of the routing first.
+      // Origin: dsv4-a5 single-card offload (stage 0.6).
+      if (config_.lacks_cpu_weights(static_cast<int64_t>(i))) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
+      // Checked: on a node-bound worker thread a full node makes these return
+      // nullptr, and nullptr passes the BufferB assert(ptr % 64 == 0) that
+      // NDEBUG removes anyway -- the crash then lands on the first write, with
+      // no dmesg line and no core. kt_checked_aligned_alloc reports the size
+      // and the thread's NUMA bind instead. See operators/common.hpp.
+      void* gate_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX gate BufferB", (long long)i);
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX up BufferB", (long long)i);
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = kt_checked_aligned_alloc(
+          64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size), "AMX down BufferB", (long long)i);
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp
@@ -455,11 +478,13 @@ class AMX_MOE_BASE {
   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
-#ifdef FORWARD_TIME_PROFILE
+    // Per-phase decode timing, enabled at runtime with KT_MOE_PHASE_TIMING=1.
+    // Nanoseconds, because the phases of a bs=1 step are single-digit
+    // microseconds. Origin: dsv4-a5 single-card offload.
+    const bool phase_timing = kt_moe_phase_timing();
     auto start_time = std::chrono::high_resolution_clock::now();
     auto last = start_time;
     long q_input_time = 0, up_gate_time = 0, act_time = 0, q_down_time = 0, down_time = 0, weight_time = 0;
-#endif
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
@@ -538,13 +563,11 @@ class AMX_MOE_BASE {
       derived()->prepare_decode_gate_input(expert_idx, qlen, input);
     }
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      q_input_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+      q_input_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
       last = now_time;
     }
-#endif
 
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
@@ -564,23 +587,19 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      up_gate_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+      up_gate_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
       last = now_time;
     }
-#endif
 
     derived()->apply_decode_activation(activated_expert, nth, qlen);
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      act_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+      act_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
       last = now_time;
     }
-#endif
 
     pool->do_work_stealing_job(
         activated_expert, nullptr,
@@ -590,13 +609,11 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      q_down_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+      q_down_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
       last = now_time;
     }
-#endif
 
     nth = T::recommended_nth(config_.hidden_size);
     pool->do_work_stealing_job(
@@ -609,13 +626,11 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      down_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+      down_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
       last = now_time;
     }
-#endif
 
     for (int e = 0; e < config_.hidden_size; e += 32) {
       __m512 x0 = _mm512_setzero_ps();
@@ -637,20 +652,17 @@ class AMX_MOE_BASE {
       f32out[1] = x1;
     }
 
-#ifdef FORWARD_TIME_PROFILE
-    {
+    if (phase_timing) [[unlikely]] {
       auto now_time = std::chrono::high_resolution_clock::now();
-      weight_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
-      last = now_time;
+      weight_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+      auto forward_total_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - start_time).count();
+      printf(
+          "[kt-phase] layer %d numa %d activated %d | q_input %.1f | up_gate %.1f | act %.1f | "
+          "q_down %.1f | down %.1f | weight %.1f | total %.1f us\n",
+          config_.layer_idx, tp_part_idx, activated_expert, q_input_time / 1000.0, up_gate_time / 1000.0,
+          act_time / 1000.0, q_down_time / 1000.0, down_time / 1000.0, weight_time / 1000.0,
+          forward_total_time / 1000.0);
     }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto forward_total_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    printf(
-        "Profiling Results (numa[%d]): activated_expert: %d, q_input: %ld us, "
-        "up_gate: %ld us, act: %ld us, q_down: %ld us, down: %ld us, weight: %ld us, total: %ld us\n",
-        tp_part_idx, activated_expert, q_input_time, up_gate_time, act_time, q_down_time, down_time, weight_time,
-        forward_total_time);
-#endif
   }
 
  protected:

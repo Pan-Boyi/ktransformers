@@ -67,6 +67,69 @@ _AVXVNNI256_PACKED_GPTQ_INT4_MAX_GROUP_SIZE = 2048
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
 
+def _zero_copy_weights_requested() -> bool:
+    """KT_ZEROCOPY_WEIGHTS, parsed exactly like KT_FULLSET_LOAD.
+
+    "" / "0" -> False, "1" -> True, anything else raises rather than being read
+    as off. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+    """
+    from .loader import zero_copy_weights_enabled
+
+    return zero_copy_weights_enabled()
+
+
+def _fullset_load_requested() -> bool:
+    """KT_FULLSET_LOAD=1: load every expert's CPU weights even with a resident mask.
+
+    By default a NativeMoEWrapper whose loader supports expert subsets and whose
+    gpu_experts_mask marks some experts resident loads only the CPU experts and
+    sets ``skip_gpu_expert_weights`` so the C++ side allocates no BufferB for the
+    resident ones. That makes a resident expert impossible to demote at runtime:
+    after a demotion the CPU would read an unallocated BufferB. With this switch
+    on, all ``num_experts`` experts are loaded and ``skip_gpu_expert_weights``
+    stays False, while ``gpu_experts_mask`` keeps marking the resident experts
+    for routing (``should_skip_expert``). Cost: host RAM for the full set.
+
+    Unset / empty / "0" -> off (the old subset path, unchanged). "1" -> on.
+    Anything else raises: a typo must not silently fall back to the subset,
+    because the caller is about to rely on every expert having CPU weights.
+    Read on every call (per layer), like KT_MXFP4_COMPACT_SCALES.
+    Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+    """
+    value = os.environ.get("KT_FULLSET_LOAD", "")
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    raise ValueError(f"KT_FULLSET_LOAD={value!r} is not 0 or 1")
+
+
+def _trim_malloc_arena() -> None:
+    """Hand the loader's freed temporaries back to the OS.
+
+    ``load_weights`` allocates and frees ~13.5 MiB of Python-side tensors and a
+    same-sized C++ staging buffer per expert. glibc keeps a good part of that in
+    its arenas, which on DeepSeek-V4-Flash measured as 20.2 resident MiB per
+    offloaded expert instead of the 15.0 MiB the BufferB allocations actually
+    need -- 22 GiB of pure fragmentation at E=96 x 43 layers. One malloc_trim
+    per layer (a few ms, load time only) removes it.
+    Origin: dsv4-a5 single-card offload (stage 0.6).
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _ptr(t: Optional[torch.Tensor]) -> int:
+    """data_ptr(), or 0 for a slot an expert subset deliberately left empty."""
+    return 0 if t is None else t.data_ptr()
+
+
+def _f32(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if t is None else t.to(torch.float32).contiguous()
+
+
 def _host_has_cpu_flag(*flag_names: str) -> bool:
     try:
         with open("/proc/cpuinfo", "r") as f:
@@ -710,6 +773,75 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.up_scales = None
         self.down_scales = None
 
+    def _cpu_expert_subset_enabled(self) -> bool:
+        """True iff this layer should read only its CPU-resident experts.
+
+        Requires (a) a loader that implements the `expert_ids` argument and
+        (b) an actual accelerator-resident set to skip. Off by default, so
+        every other backend keeps loading all `num_experts` experts.
+        Origin: dsv4-a5 single-card offload (stage 0.6).
+
+        KT_FULLSET_LOAD=1 turns it off unconditionally (see
+        ``_fullset_load_requested``); the mask is left untouched, so routing
+        still skips the resident experts.
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+        """
+        if _fullset_load_requested():
+            return False
+        return bool(getattr(self.loader, "SUPPORTS_EXPERT_SUBSET", False)) and self.num_gpu_experts > 0
+
+    def lacks_cpu_weights(self, expert_id: int) -> bool:
+        """True iff the C++ backend holds no CPU weights (no BufferB) for this slot.
+
+        Answers from what ``load_weights`` actually allocated: the slots it
+        loaded are snapshotted right after the C++ load, from the
+        ``skip_gpu_expert_weights`` value the backend was built with and the
+        mask at that moment. Unlike ``GeneralMOEConfig::lacks_cpu_weights``
+        (common.hpp), which reads the *live* mask, this does not change when a
+        caller later rewrites ``gpu_experts_mask`` (e.g. a resident swap):
+        BufferB is never allocated after load. With KT_FULLSET_LOAD=1 it is
+        False for every slot. Raises before ``load_weights``.
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+        """
+        slots = getattr(self, "_cpu_weight_slots", None)
+        if slots is None:
+            raise RuntimeError(f"layer {self.layer_idx}: lacks_cpu_weights() before load_weights()")
+        e = int(expert_id)
+        if not 0 <= e < self.num_experts:
+            raise IndexError(f"layer {self.layer_idx}: expert {e} out of range [0, {self.num_experts})")
+        return e not in slots
+
+    def cpu_weight_expert_ids(self) -> List[int]:
+        """Slots the C++ backend loaded CPU weights for (ascending); see lacks_cpu_weights.
+
+        Origin: dsv41 stream-prefill F2-3 (full-set load for runtime demotion).
+        """
+        slots = getattr(self, "_cpu_weight_slots", None)
+        if slots is None:
+            raise RuntimeError(f"layer {self.layer_idx}: cpu_weight_expert_ids() before load_weights()")
+        return sorted(slots)
+
+    def _cpu_logical_expert_ids(self, physical_to_logical_map_cpu) -> List[int]:
+        """Checkpoint expert ids this layer must actually read.
+
+        ``cpu_expert_ids()`` gives the *physical slots* the CPU owns (the mask
+        is indexed by slot, exactly like ``should_skip_expert``). The C++ load
+        path then reads ``gate_projs[0][expert_map(p2l, slot)]``, so with a
+        non-identity EPLB map the checkpoint ids to materialise are the images
+        of those slots under the map, not the slots themselves.
+        Origin: dsv4-a5 single-card offload (stage 0.6).
+        """
+        slots = self.cpu_expert_ids()
+        p2l = physical_to_logical_map_cpu
+        if p2l is None:
+            return slots
+        table = p2l.reshape(-1).tolist()
+        if len(table) < self.num_experts:
+            raise ValueError(
+                f"physical_to_logical_map has {len(table)} entries, expected at least {self.num_experts}"
+            )
+        return sorted({int(table[s]) for s in slots})
+
     @staticmethod
     def _create_loader(method: str, weight_path: str):
         if method == "RAWINT4":
@@ -779,10 +911,21 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"language_model.model.layers.{self.layer_idx}",
             f"model.language_model.layers.{self.layer_idx}",
         ]
+        # Partial CPU residency: read only the experts this rank actually keeps
+        # on the CPU (gpu_experts_mask == False). Without this the loader
+        # materialises all `num_experts` experts -- 3.19 GiB per layer, 137 GiB
+        # for DeepSeek-V4-Flash -- even though the masked ones are never used.
+        # Loaders that do not implement the subset keep their old behaviour.
+        # Origin: dsv4-a5 single-card offload (stage 0.6).
+        # KT_FULLSET_LOAD=1 disables the subset (all experts are read).
+        # Origin: dsv41 stream-prefill F2-3.
+        load_kwargs = {}
+        if self._cpu_expert_subset_enabled():
+            load_kwargs["expert_ids"] = self._cpu_logical_expert_ids(physical_to_logical_map_cpu)
         weights = None
         for base_key in _candidates:
             try:
-                weights = self.loader.load_experts(base_key)
+                weights = self.loader.load_experts(base_key, **load_kwargs)
                 break
             except (ValueError, KeyError):
                 continue
@@ -810,38 +953,46 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.gate_scales = weights["gate_scale"]
             self.up_scales = weights["up_scale"]
             self.down_scales = weights["down_scale"]
+            # With a CPU subset the skipped slots are None; probe a real one.
+            _probe = next((t for t in self.gate_scales if t is not None), None)
+            if _probe is None:
+                raise ValueError(f"Layer {self.layer_idx}: no expert weights were loaded on the CPU")
             if self.method == "RAWINT4":
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
+                assert _probe.dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "FP8":
-                if self.gate_scales[0].dtype != torch.float32:
-                    self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
-                    self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
-                    self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
-                assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8"
+                if _probe.dtype != torch.float32:
+                    self.gate_scales = [_f32(t) for t in weights["gate_scale"]]
+                    self.up_scales = [_f32(t) for t in weights["up_scale"]]
+                    self.down_scales = [_f32(t) for t in weights["down_scale"]]
+                    _probe = next(t for t in self.gate_scales if t is not None)
+                assert _probe.dtype == torch.float32, "Expected float32 scales for FP8"
             elif self.method == "FP8_PERCHANNEL":
-                if self.gate_scales[0].dtype != torch.float32:
-                    self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
-                    self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
-                    self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
-                assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
+                if _probe.dtype != torch.float32:
+                    self.gate_scales = [_f32(t) for t in weights["gate_scale"]]
+                    self.up_scales = [_f32(t) for t in weights["up_scale"]]
+                    self.down_scales = [_f32(t) for t in weights["down_scale"]]
+                    _probe = next(t for t in self.gate_scales if t is not None)
+                assert _probe.dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
                 # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                assert _probe.dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
             elif self.method == "NVFP4":
                 # e4m3 block scale x per-tensor global, folded to bf16 by the loader.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
+                assert _probe.dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
-                assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
+                assert _probe.dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
 
         t2 = time.time()
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [[t.data_ptr() for t in self.gate_weights]]
-        up_ptrs = [[t.data_ptr() for t in self.up_weights]]
-        down_ptrs = [[t.data_ptr() for t in self.down_weights]]
+        # Slots left None by an expert subset become nullptr; the C++ load path
+        # skips exactly those experts (config.lacks_cpu_weights).
+        gate_ptrs = [[_ptr(t) for t in self.gate_weights]]
+        up_ptrs = [[_ptr(t) for t in self.up_weights]]
+        down_ptrs = [[_ptr(t) for t in self.down_weights]]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
@@ -849,9 +1000,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             up_scale_ptrs = [[0 for _ in self.up_weights]]
             down_scale_ptrs = [[0 for _ in self.down_weights]]
         else:
-            gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
-            up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
-            down_scale_ptrs = [[t.data_ptr() for t in self.down_scales]]
+            gate_scale_ptrs = [[_ptr(t) for t in self.gate_scales]]
+            up_scale_ptrs = [[_ptr(t) for t in self.up_scales]]
+            down_scale_ptrs = [[_ptr(t) for t in self.down_scales]]
         t3 = time.time()
 
         moe_config = MOEConfig(
@@ -882,6 +1033,44 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 f"only valid for FP8/MXFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
+        # Tell the C++ backend that gpu_experts_mask also describes CPU
+        # residency, so it allocates BufferB only for the offloaded experts.
+        # Only set where the loader really produced a subset, because the C++
+        # skips are implemented in the MXFP4 load path alone.
+        # Origin: dsv4-a5 single-card offload (stage 0.6).
+        # Under KT_FULLSET_LOAD=1 load_kwargs is empty, so this is False and
+        # BufferB is allocated and loaded for every expert.
+        # Origin: dsv41 stream-prefill F2-3.
+        moe_config.skip_gpu_expert_weights = bool(load_kwargs)
+        # KT_ZEROCOPY_WEIGHTS is implemented only in the AMX MXFP4 load path
+        # (operators/amx/fp4-moe.hpp). Every other backend would ignore it and
+        # quietly keep memcpy'ing, i.e. the run would look like it took the new
+        # path. Refuse instead. Origin: dsv41 stream-prefill, CPU-MoE weight
+        # zero-copy.
+        if _zero_copy_weights_requested() and self.method != "MXFP4":
+            raise RuntimeError(
+                f"KT_ZEROCOPY_WEIGHTS=1 with method={self.method!r}: only the AMX MXFP4 backend "
+                "serves CPU weights directly from the checkpoint mapping"
+            )
+        if _fullset_load_requested() and self.num_gpu_experts > 0 and self.method != "MXFP4":
+            # Other backends skip masked experts in their load paths by
+            # should_skip_expert(), ignoring skip_gpu_expert_weights: the
+            # BufferB would exist but never be filled. Refuse, don't pretend.
+            # Origin: dsv41 stream-prefill F2-3.
+            raise RuntimeError(
+                f"KT_FULLSET_LOAD=1 with method={self.method!r}: only the AMX MXFP4 backend loads "
+                "CPU weights for experts marked in gpu_experts_mask"
+            )
+        # Store the E8M0 scale as one byte per k-group instead of one FP32.
+        # Native MXFP4 checkpoints (DeepSeek-V4-Flash) carry F8_E8M0 scales, so
+        # the FP32 slot never holds anything but a power of two -- 15.0% of the
+        # resident expert (2.25 of 15.014 MiB per expert per layer) is dead.
+        # Opt out with KT_MXFP4_COMPACT_SCALES=0 if a checkpoint ever ships a
+        # scale that is not a positive power of two (the loader throws then).
+        # Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+        moe_config.compact_mxfp4_scales = self.method == "MXFP4" and os.environ.get(
+            "KT_MXFP4_COMPACT_SCALES", "1"
+        ) not in ("0", "false", "False")
 
         # Use gate_projs instead of gate_proj for per-expert pointers
         moe_config.gate_projs = gate_ptrs
@@ -896,7 +1085,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # So: group_size = hidden_size / scale.shape[1]
 
         if self.method == "RAWINT4":
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // _probe.shape[1]
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
@@ -912,7 +1101,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
             # (e.g. DeepSeek-V4-Flash routed experts)
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // _probe.shape[1]
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
@@ -922,13 +1111,20 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     "No MXFP4 backend available after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
                 )
+            if _fullset_load_requested() and self.num_gpu_experts > 0 and backend_cls is not AMXFP4_KGroup_MOE:
+                # AVX2MXFP4_MOE's load path skips masked experts by
+                # should_skip_expert() (operators/avx2/mxfp4-moe.hpp), so their
+                # BufferB would stay unfilled. Origin: dsv41 stream-prefill F2-3.
+                raise RuntimeError(
+                    f"KT_FULLSET_LOAD=1 needs AMXFP4_KGroup_MOE, runtime selected {backend_cls.__name__}"
+                )
             self.moe = backend_cls(moe_config)
         elif self.method == "NVFP4":
             # NVFP4: same E2M1 nibble packing as MXFP4, but a per-16 block scale
             # in E4M3 times a per-tensor global scale. The loader has already
             # folded both into one bf16 scale per group, so the FP4 kernel runs
             # this unchanged -- only group_size differs (16 vs 32).
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // _probe.shape[1]
             if group_size != 16:
                 raise RuntimeError(
                     f"NVFP4 expects group_size 16, derived {group_size} from "
@@ -955,7 +1151,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "MXFP8":
             # MXFP8: FP8 E4M3fn byte weights, ue8m0/uint8 per-32 group scale
             # (e.g. MiniMax-M3-Preview)
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // _probe.shape[1]
             moe_config.quant_config.bits = 8
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
@@ -982,7 +1178,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe = AMXFP8PerChannel_MOE(moe_config)
         elif self.method == "GPTQ_INT4":
             # GPTQ symmetric INT4: qweight (int32) + scales (fp32)
-            group_size = self.gate_scales[0].shape[0]  # scales shape [K/gs, N], first dim = num_groups
+            group_size = _probe.shape[0]  # scales shape [K/gs, N], first dim = num_groups
             # hidden_size / num_groups = group_size
             actual_gs = self.hidden_size // group_size
             moe_config.quant_config.bits = 4
@@ -999,7 +1195,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "SYCL_GPTQ_INT4":
             # Same symmetric GPTQ tensor layout as GPTQ_INT4; execution is on
             # the selected SYCL device.
-            num_groups = self.gate_scales[0].shape[0]
+            num_groups = _probe.shape[0]
             actual_gs = self.hidden_size // num_groups
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = actual_gs
@@ -1017,6 +1213,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
+        # Snapshot of the slots that got a BufferB, taken once the backend holds
+        # the weights and read back from the config C++ was built from. Backs
+        # lacks_cpu_weights() / cpu_weight_expert_ids().
+        # Origin: dsv41 stream-prefill F2-3.
+        if moe_config.skip_gpu_expert_weights:
+            self._cpu_weight_slots = frozenset(self.cpu_expert_ids())
+        else:
+            self._cpu_weight_slots = frozenset(range(self.num_experts))
         t5 = time.time()
 
         del self.gate_weights
@@ -1027,7 +1231,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.up_scales
             del self.down_scales
 
+        # The `weights` dict still holds the only remaining references to the
+        # per-expert tensors (the self.* attributes above were just aliases),
+        # so it has to go before the arena trim can actually reclaim them.
+        del weights
         NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+        _trim_malloc_arena()
         t6 = time.time()
 
         print(

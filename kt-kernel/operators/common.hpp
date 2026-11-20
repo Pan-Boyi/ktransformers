@@ -13,9 +13,17 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+
+#if defined(__linux__)
+#include <numaif.h>
+#include <sched.h>
+#endif
 
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
@@ -46,6 +54,114 @@
   })
 
 #define expert_map(m, x) (m != nullptr ? m[(x)] : (x))
+
+// Runtime switch for the per-phase decode timing in
+// operators/amx/moe_base.hpp::forward_decode. Off by default; the check is one
+// predictable load of a function-local static, and it only guards work that is
+// already outside the per-task inner loops.
+//   KT_MOE_PHASE_TIMING=1 ./your_run   ->  one line per layer per NUMA node
+// Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+inline bool kt_moe_phase_timing() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("KT_MOE_PHASE_TIMING");
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
+// Checked host allocation.
+//
+// Worker threads are hard-bound with hwloc_set_membind(BIND|STRICT|THREAD)
+// (cpu_backend/worker_pool.h) and never unbound, so a full node makes
+// std::aligned_alloc return nullptr instead of spilling. nullptr then passes
+// BufferB's assert(ptr % 64 == 0) -- which NDEBUG removes anyway -- and the
+// first write is a SIGSEGV with no dmesg line and no core. These helpers do
+// not prevent that; they make it say what happened.
+
+// Where the calling thread runs and what its mempolicy allows. Failure path only.
+inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
+  if (hard_bound != nullptr) *hard_bound = false;
+  std::ostringstream oss;
+#if defined(__linux__)
+  const int cpu = sched_getcpu();
+  const int cpu_node = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
+  oss << "cpu " << cpu;
+  if (numa_available() >= 0) {
+    oss << " on node " << cpu_node;
+
+    int mode = -1;
+    unsigned long mask[16] = {0};  // 1024 nodes
+    if (get_mempolicy(&mode, mask, sizeof(mask) * 8, nullptr, 0) == 0) {
+      const char* mode_name = "MPOL_?";
+      switch (mode) {
+        case MPOL_DEFAULT: mode_name = "MPOL_DEFAULT (not bound)"; break;
+        case MPOL_PREFERRED: mode_name = "MPOL_PREFERRED"; break;
+        case MPOL_BIND:
+          mode_name = "MPOL_BIND (hard-bound)";
+          if (hard_bound != nullptr) *hard_bound = true;
+          break;
+        case MPOL_INTERLEAVE: mode_name = "MPOL_INTERLEAVE"; break;
+        default: break;
+      }
+      oss << ", mempolicy " << mode_name << " nodes {";
+      const int max_node = numa_max_node();
+      bool first = true;
+      for (int n = 0; n <= max_node && n < 1024; n++) {
+        if (!((mask[n / 64] >> (n % 64)) & 1ULL)) continue;
+        if (!first) oss << ",";
+        first = false;
+        long long free_bytes = 0;
+        const long long total_bytes = numa_node_size64(n, &free_bytes);
+        oss << n << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20) << " MiB";
+      }
+      // An empty mask means the policy names no node (MPOL_DEFAULT): report the
+      // node this thread actually runs on, so the numbers are never missing.
+      if (first && cpu_node >= 0) {
+        long long free_bytes = 0;
+        const long long total_bytes = numa_node_size64(cpu_node, &free_bytes);
+        oss << "all; local node " << cpu_node << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20)
+            << " MiB";
+      } else if (first) {
+        oss << "-";
+      }
+      oss << "}";
+    } else {
+      oss << ", mempolicy unavailable (get_mempolicy failed)";
+    }
+  } else {
+    oss << ", libnuma reports no NUMA support";
+  }
+#else
+  oss << "unknown (non-Linux build)";
+#endif
+  return oss.str();
+}
+
+// std::aligned_alloc that throws std::runtime_error (via ASSERT_RELEASE, which
+// NDEBUG cannot remove) instead of returning nullptr. `index` = expert id or -1.
+inline void* kt_checked_aligned_alloc(size_t alignment, size_t size, const char* what, long long index = -1) {
+  void* ptr = std::aligned_alloc(alignment, size);
+  if (ptr == nullptr) {
+    bool hard_bound = false;
+    const std::string binding = kt_thread_numa_binding(&hard_bound);
+    std::ostringstream oss;
+    oss << "kt-kernel: allocation of " << what;
+    if (index >= 0) oss << " for expert " << index;
+    oss << " failed: std::aligned_alloc(" << alignment << ", " << size << ") returned nullptr (" << size
+        << " bytes = " << (size >> 20) << " MiB). Calling thread: " << binding << ". ";
+    if (hard_bound) {
+      oss << "That thread is hard-bound to the node(s) above (hwloc_set_membind BIND|STRICT|THREAD, "
+             "cpu_backend/worker_pool.h) and kt never resets the bind, so this allocation could not fall back "
+             "to another node however much memory the rest of the machine has.";
+    } else {
+      oss << "That thread is not node-bound, so this is a machine-wide or cgroup/rlimit shortage rather than a "
+             "NUMA bind (kt's worker threads, unlike this one, are hard-bound in cpu_backend/worker_pool.h).";
+    }
+    const std::string msg = oss.str();
+    ASSERT_RELEASE(ptr != nullptr, msg.c_str());
+  }
+  return ptr;
+}
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
@@ -252,9 +368,40 @@ struct GeneralMOEConfig {
     }
   }
 
+  // When true, the CPU backend allocates and loads BufferB only for experts
+  // whose gpu_experts_mask entry is false. The mask then also describes CPU
+  // *residency*, not just routing: touching the weights of a masked expert is
+  // a null dereference. Opt-in because only the MXFP4 backend implements the
+  // matching skips in its load path (see operators/amx/fp4-moe.hpp).
+  // Origin: dsv4-a5 single-card offload (stage 0.6).
+  bool skip_gpu_expert_weights = false;
+
+  // When true, the MXFP4 BufferB stores one E8M0 exponent byte per k-group
+  // instead of one FP32, shrinking a resident expert from 0.625 to 0.53125
+  // bytes per weight element (15.014 -> 12.76 MiB per expert per layer, i.e.
+  // 15.0% less host RAM). Native MXFP4 checkpoints are E8M0 by construction;
+  // a scale that is not a positive power of two now throws at load time
+  // instead of silently taking the FP32 fallback, so this stays opt-in.
+  // Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
+  bool compact_mxfp4_scales = false;
+
+  // Pure residency test: true iff `expert_id` lives on the accelerator and has
+  // no CPU-side weights. No bounds handling, so it is safe to drive allocation
+  // loops (0 <= expert_id < expert_num by construction there).
+  inline bool is_gpu_expert(int64_t expert_id) const {
+    return gpu_experts_mask != nullptr && gpu_experts_mask[expert_id];
+  }
+
+  // True iff the CPU has no weights for `expert_id` because it was never
+  // allocated. Identical to is_gpu_expert() unless the subset mode is off, in
+  // which case every expert is resident on the CPU as well.
+  inline bool lacks_cpu_weights(int64_t expert_id) const {
+    return skip_gpu_expert_weights && is_gpu_expert(expert_id);
+  }
+
   // Check if expert should be skipped (invalid, out of range, or on GPU)
   inline bool should_skip_expert(int64_t expert_id) const {
-    return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
+    return expert_id < 0 || expert_id >= expert_num || is_gpu_expert(expert_id);
   }
 
   void* gate_proj = nullptr;

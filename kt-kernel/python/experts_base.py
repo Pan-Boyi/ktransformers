@@ -10,7 +10,7 @@ This module contains base classes and utilities shared across all backend implem
 from __future__ import annotations
 
 import torch
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import ctypes
 import logging
@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 # Memoized result of the C++ worker probe. None = not probed yet.
 _ascend_worker_degraded: Optional[bool] = None
+
+
+_cpuinfer_inline: bool | None = None
 
 
 def _ascend_callback_worker_running() -> Optional[bool]:
@@ -86,6 +89,25 @@ def _uses_external_npu_report_subscriber() -> bool:
     return os.environ.get("KT_EXTERNAL_NPU_REPORT_SUBSCRIBER", "") == "1"
 
 
+def _cpuinfer_inline_enabled() -> bool:
+    """True iff this build was asked to run submitted tasks on the calling thread.
+
+    The switch itself lives in C++ (KT_CPUINFER_INLINE, cpu_backend/
+    task_queue.cpp): one reader, one printed line, and a build without the
+    feature simply has no probe and answers False -- the queue path then runs
+    byte for byte as before. Memoized: the env is read once over there too,
+    and this sits on the per-layer forward path.
+    """
+    global _cpuinfer_inline
+    if _cpuinfer_inline is None:
+        probe = getattr(kt_kernel_ext, "cpuinfer_inline_enabled", None)
+        try:
+            _cpuinfer_inline = bool(probe()) if probe is not None else False
+        except Exception:
+            _cpuinfer_inline = False
+    return _cpuinfer_inline
+
+
 def _ensure_ascend_callback_worker() -> None:
     """Start kt-kernel ACL callback worker (idempotent)."""
     if _uses_external_npu_report_subscriber():
@@ -124,6 +146,38 @@ def _sglang_is_capture_mode() -> bool:
         return False
 
 
+# Caller-supplied "is a graph being captured right now?" probe. None = the
+# sglang default above, so existing sglang deployments behave as before. A
+# host framework other than sglang (e.g. vLLM-Ascend) installs its own, since
+# the sglang flag is never set there and torch.npu.is_current_stream_capturing()
+# alone is not trusted during torch_npu capture (see _wait_device).
+_capture_probe: Optional[Callable[[], bool]] = None
+
+
+def set_capture_probe(probe: Optional[Callable[[], bool]]) -> None:
+    """Install the host framework's capture-state probe; None restores the sglang default.
+
+    Unlike the default probe, an installed probe's exceptions propagate: a
+    probe that cannot answer must not be read as "not capturing", because the
+    consequence is a device synchronize on a captured stream (107027/107030).
+    """
+    global _capture_probe
+    if probe is not None and not callable(probe):
+        raise TypeError(f"capture probe must be callable or None, got {type(probe).__name__}")
+    _capture_probe = probe
+
+
+def get_capture_probe() -> Optional[Callable[[], bool]]:
+    return _capture_probe
+
+
+def _is_capture_mode() -> bool:
+    """True while the host framework is capturing a device graph."""
+    if _capture_probe is not None:
+        return bool(_capture_probe())
+    return _sglang_is_capture_mode()
+
+
 def _wait_device(device: torch.device) -> None:
     """Block until pending async copies on `device`'s current stream finish.
 
@@ -143,9 +197,10 @@ def _wait_device(device: torch.device) -> None:
         # raises) while capturing, the synchronize() below would attempt a
         # stream sync on a captured stream and crash (107027/107030). Mirror the
         # capture detection used by kt_ep_wrapper._npu_use_graph_host_callback by
-        # also consulting sglang's global capture flag, which model_capture_mode()
-        # sets reliably around the whole capture loop.
-        if _sglang_is_capture_mode():
+        # also consulting the host framework's capture probe (default: sglang's
+        # global flag, which model_capture_mode() sets reliably around the whole
+        # capture loop; see set_capture_probe).
+        if _is_capture_mode():
             return
         torch.npu.synchronize(device)
     elif device.type == "cuda":
@@ -154,7 +209,7 @@ def _wait_device(device: torch.device) -> None:
                 return
         except Exception:
             pass
-        if _sglang_is_capture_mode():
+        if _is_capture_mode():
             return
         torch.cuda.synchronize(device)
 
@@ -460,6 +515,17 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # Backend-specific initialization happens in subclasses
         self.moe = None
 
+    def cpu_expert_ids(self) -> List[int]:
+        """Logical ids of the experts this layer keeps on the CPU.
+
+        The complement of ``gpu_experts_mask``. The order is ascending logical
+        id; the list is *not* a compaction map -- the CPU backend keeps
+        indexing every per-expert structure by logical id, so an arbitrary
+        (non-prefix) residency mask works with no renumbering on either side.
+        Origin: dsv4-a5 single-card offload (stage 0.6).
+        """
+        return torch.nonzero(~self.gpu_experts_mask, as_tuple=False).flatten().tolist()
+
     @abstractmethod
     def load_weights_from_tensors(
         self,
@@ -707,6 +773,23 @@ class BaseMoEWrapper(_MoEBase, ABC):
             output_cpu[current_slot].data_ptr(),
             incremental,
         )
+        if _cpuinfer_inline_enabled() and hasattr(self.cpu_infer, "run_inline"):
+            # Inline is only sound while this layer is the whole content of the
+            # queue, so both deferred state bits are *read*, not assumed:
+            # ``incremental`` says the previous layer left a task pending, and
+            # the deferred ids of this slot say this layer will leave one. Both
+            # are 0 on the NPU graph path (cross-layer deferral is refused
+            # there), but a wrapper that ever produced one must keep the queue.
+            has_deferred = (
+                self.max_deferred_experts_per_token > 0 and (deferred_experts_ids_cpu[current_slot] >= 0).any().item()
+            )
+            if not incremental and not has_deferred:
+                # run_inline falls back to submit() by itself if the queue is
+                # not empty after all; either way the sync below drains it.
+                self.cpu_infer.run_inline(immediate_task)
+                BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+                self.cpu_infer.sync(0)
+                return
         self.cpu_infer.submit(immediate_task)
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         has_deferred = (
@@ -815,6 +898,46 @@ class BaseMoEWrapper(_MoEBase, ABC):
             else:
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+
+    def has_pending_deferred(self, layer_idx: Optional[int] = None) -> bool:
+        """True iff this layer left a deferred CPU task queued for the next layer.
+
+        Public read of the bookkeeping ``submit_forward`` / ``run_pinned_forward_sync``
+        keep; callers that need the drain allowance must use this instead of the
+        private ``_layer_has_pending_deferred`` dict, whose name and shape are
+        not part of the API. Origin: dsv4-a5 single-card offload (M3 side stream).
+        """
+        idx = self.layer_idx if layer_idx is None else layer_idx
+        return bool(BaseMoEWrapper._layer_has_pending_deferred.get(idx, False))
+
+    def sync_cpu_only(self) -> None:
+        """Block until the CPU MoE queue has drained. No device sync, no H2D copy.
+
+        ``sync_forward`` waits for the whole accelerator (``torch.npu.synchronize``)
+        before draining, which also waits for the device-resident experts and so
+        erases any CPU/device overlap. This is the drain on its own: it blocks on
+        kt's ``TaskQueue`` condition variable only (``cpu_backend/task_queue.cpp``),
+        touches no device API, and leaves the H2D of the result to the caller.
+
+        Note the queue is process-global (one ``CPUInfer`` singleton for every
+        layer), so this waits for whatever else is queued too; the allowance comes
+        from *this* layer's deferred flag, exactly as in ``sync_forward``.
+
+        Framework-managed overlap, all of it public API::
+
+            wrapper.copy_inputs_to_cpu_buffers(h, topk_ids, topk_weights)
+            # the D2H above is async on the current stream: the caller must make
+            # the host wait for *that copy* (e.g. event.record(); event.synchronize())
+            # before the CPU reads the pinned input -- a targeted wait, not a
+            # device-wide one.
+            wrapper.forward_on_pinned_buffers(h, stream)   # submit, no device wait
+            ...                                            # device-side work here
+            wrapper.sync_cpu_only()
+            out = wrapper.copy_forward_output_to_device(h)
+
+        Origin: dsv4-a5 single-card offload (M3 side stream).
+        """
+        self.cpu_infer.sync(1 if self.has_pending_deferred() else 0)
 
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Copy pinned CPU output to the device tensor (CPU work already finished)."""

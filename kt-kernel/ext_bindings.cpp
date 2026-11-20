@@ -547,7 +547,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.attr("__int8_kernel__") = "amx-int8";
 #elif defined(__AVX512BF16__) && defined(__AVX512VNNI__)
   m.attr("__cpu_variant__") = "avx512_bf16";
+#if defined(USE_AMX_AVX_KERNEL)
   m.attr("__int8_kernel__") = amx::int8_vnni_backend_name();
+#else
+  m.attr("__int8_kernel__") = "unsupported";
+#endif
 #elif defined(__AVX512VBMI__)
   m.attr("__cpu_variant__") = "avx512_vbmi";
   m.attr("__int8_kernel__") = "unsupported";
@@ -562,6 +566,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.attr("__int8_kernel__") = "unsupported";
 #endif
   m.attr("__int8_weight_layout__") = "kt-int8-n32-k64-vnni-v1";
+#if defined(__x86_64__)
+  // Versioned native capability: Python must not claim full-set AVX2 loads
+  // when paired with an older extension that still skips masked experts.
+  m.attr("__mxfp4_avx2_fullset_load__") = true;
+#endif
 #if defined(USE_AMX_AVX_KERNEL) && defined(__AVX512BF16__)
   m.attr("__rawint4_kernel__") = "amx-int4-kgroup-g32";
 #else

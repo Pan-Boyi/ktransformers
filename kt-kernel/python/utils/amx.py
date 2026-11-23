@@ -22,6 +22,7 @@ from .loader import (
 )
 from kt_kernel_ext.moe import MOEConfig
 import kt_kernel_ext.moe as _moe_mod
+import kt_kernel_ext as _ext_mod
 
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
@@ -303,6 +304,19 @@ def _select_mxfp4_backend():
     if _HAS_AVX2_MXFP4_SUPPORT:
         return AVX2MXFP4_MOE
     return None
+
+
+def mxfp4_backend_capabilities():
+    """Capabilities of the selected compiled backend, not just the host ISA."""
+    backend = _select_mxfp4_backend()
+    amx = backend is not None and backend is AMXFP4_KGroup_MOE
+    avx2 = backend is not None and backend is AVX2MXFP4_MOE
+    return {
+        "backend": None if backend is None else backend.__name__,
+        "fullset_load": amx or (avx2 and bool(getattr(_ext_mod, "__mxfp4_avx2_fullset_load__", False))),
+        "zero_copy_weights": amx,
+        "compact_scales": amx,
+    }
 
 
 def _select_mxfp8_backend():
@@ -892,6 +906,25 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
         import time
 
+        if self.method == "MXFP4":
+            capabilities = mxfp4_backend_capabilities()
+            if _zero_copy_weights_requested() and not capabilities["zero_copy_weights"]:
+                raise RuntimeError(
+                    f"{capabilities['backend']} does not support KT_ZEROCOPY_WEIGHTS; "
+                    "use the packed-copy AVX2 profile with zerocopy_w13=false"
+                )
+            if _fullset_load_requested() and not capabilities["fullset_load"]:
+                raise RuntimeError(
+                    f"{capabilities['backend']} lacks native full-set load support; rebuild with the AVX2 residency fix"
+                )
+            compact = os.environ.get("KT_MXFP4_COMPACT_SCALES")
+            if (compact is not None and compact not in ("0", "false", "False")
+                    and not capabilities["compact_scales"]):
+                raise RuntimeError(
+                    f"{capabilities['backend']} uses FP32 scales; unset KT_MXFP4_COMPACT_SCALES or set it to 0"
+                )
+            logger.info("[KT] MXFP4 capabilities: %s", capabilities)
+
         if NativeMoEWrapper._native_loader_instance is None:
             t_recreate_start = time.time()
             NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
@@ -1068,7 +1101,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # Opt out with KT_MXFP4_COMPACT_SCALES=0 if a checkpoint ever ships a
         # scale that is not a positive power of two (the loader throws then).
         # Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
-        moe_config.compact_mxfp4_scales = self.method == "MXFP4" and os.environ.get(
+        moe_config.compact_mxfp4_scales = self.method == "MXFP4" and capabilities["compact_scales"] and os.environ.get(
             "KT_MXFP4_COMPACT_SCALES", "1"
         ) not in ("0", "false", "False")
 
@@ -1110,13 +1143,6 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise RuntimeError(
                     "No MXFP4 backend available after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
-                )
-            if _fullset_load_requested() and self.num_gpu_experts > 0 and backend_cls is not AMXFP4_KGroup_MOE:
-                # AVX2MXFP4_MOE's load path skips masked experts by
-                # should_skip_expert() (operators/avx2/mxfp4-moe.hpp), so their
-                # BufferB would stay unfilled. Origin: dsv41 stream-prefill F2-3.
-                raise RuntimeError(
-                    f"KT_FULLSET_LOAD=1 needs AMXFP4_KGroup_MOE, runtime selected {backend_cls.__name__}"
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "NVFP4":
@@ -1273,6 +1299,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             raise NotImplementedError(
                 "write_weight_scale_to_buffer_task is not available for this backend implementation."
             )
+
+        if self.lacks_cpu_weights(expert_id):
+            raise RuntimeError(f"layer {self.layer_idx}: expert {expert_id} has no loaded CPU weights")
 
         self.cpu_infer.submit(
             self.moe.write_weight_scale_to_buffer_task(

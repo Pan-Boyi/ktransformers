@@ -777,7 +777,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           nth_gate * config_.expert_num, nullptr,
           [this, nth_gate, physical_to_logical_map](int task_id) {
             uint64_t expert_idx = task_id / nth_gate;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.lacks_cpu_weights(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth_gate;
             size_t weight_offset = ((size_t)lid * config_.intermediate_size * config_.hidden_size) / 2;
@@ -791,7 +791,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           nth_down * config_.expert_num, nullptr,
           [this, nth_down, physical_to_logical_map](int task_id) {
             uint64_t expert_idx = task_id / nth_down;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.lacks_cpu_weights(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth_down;
             size_t weight_offset = ((size_t)lid * config_.hidden_size * config_.intermediate_size) / 2;
@@ -803,7 +803,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           config_.expert_num, nullptr,
           [this, physical_to_logical_map, group_size](int task_id) {
             uint64_t expert_idx = task_id;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.lacks_cpu_weights(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
             convert_or_copy(gate_bb_[expert_idx]->d, (ggml_bf16_t*)config_.gate_scale + lid * scale_elem_count,
@@ -826,7 +826,8 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                                const std::vector<uintptr_t>& w13_scale_ptrs,
                                const std::vector<uintptr_t>& w2_weight_ptrs,
                                const std::vector<uintptr_t>& w2_scale_ptrs) const {
-    if (expert_id < 0 || expert_id >= config_.expert_num || gate_bb_[expert_id] == nullptr ||
+    if (expert_id < 0 || expert_id >= config_.expert_num || config_.lacks_cpu_weights(expert_id) ||
+        gate_bb_[expert_id] == nullptr ||
         up_bb_[expert_id] == nullptr || down_bb_[expert_id] == nullptr)
       throw std::runtime_error("MXFP4 AVX2 write_weights_to_buffer: invalid expert");
 
@@ -998,7 +999,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
             tpc.expert_num, nullptr,
             [&, i, per_tp_interm, full_interm, gate_buf, up_buf, down_buf, gate_up_wt_per_expert,
              down_wt_per_expert](int eid) {
-              if (tpc.should_skip_expert(eid)) return;
+              if (tpc.lacks_cpu_weights(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
 
               // H1 & H2: Validate source pointers and lid bounds
